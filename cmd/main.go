@@ -1,102 +1,85 @@
 package main
 
 import (
-	"log"
+	"fmt"
 	"net"
-	"time"
-
-	"github.com/freman/gps2mqtt/mqtt"
-	"github.com/freman/gps2mqtt/protocol/gt06"
-	"github.com/rs/zerolog"
 )
 
-const (
-	serverAddr = ":8888" // You can change this port as needed
-)
-
-type CustomGT06Listener struct {
-	*gt06.Listener
+type Message struct {
+	from    string
+	payload []byte
 }
 
-func NewCustomGT06Listener() *CustomGT06Listener {
-	return &CustomGT06Listener{
-		Listener: &gt06.Listener{
-			Listen: serverAddr,
-		},
+type Server struct {
+	listenAddr string
+	ln         net.Listener
+	quitCh     chan struct{}
+	msgCh      chan Message
+}
+
+func NewServer(listenAddr string) *Server {
+	return &Server{
+		listenAddr: listenAddr,
+		quitCh:     make(chan struct{}),
+		msgCh:      make(chan Message, 10),
 	}
 }
 
-func (l *CustomGT06Listener) handleClientConnection(conn net.Conn) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("Recovered from panic in connection handler: %v", r)
-		}
-		if err := conn.Close(); err != nil {
-			log.Printf("Error closing connection: %v", err)
-		}
-	}()
-
-	log.Printf("New connection from %s", conn.RemoteAddr())
-
-	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		log.Printf("Failed to set read deadline: %v", err)
-		return
+func (s *Server) Start() error {
+	ln, err := net.Listen("tcp", s.listenAddr)
+	if err != nil {
+		return err
 	}
+	defer ln.Close()
+	s.ln = ln
+	s.acceptLoop()
+	<-s.quitCh
+	close(s.msgCh)
 
-	packetChan := make(chan mqtt.Identifier)
-
-	logger := zerolog.New(log.Writer()).With().Timestamp().Logger()
-
-	go func() {
-		for msg := range packetChan {
-			if msg == nil {
-				log.Println("Received nil message from channel")
-				continue
-			}
-
-			if pkt, ok := msg.(*gt06.Packet); ok {
-				onPacketReceived(pkt)
-			} else {
-				log.Printf("Received unknown MQTT Identifier type: %T", msg)
-			}
-		}
-	}()
-
-	l.HandleConnection(conn, packetChan, logger)
+	return nil
 }
 
-func onPacketReceived(pkt *gt06.Packet) {
-	log.Printf("[GPS Data] Device: %s | Time: %s | Lat: %.6f | Lon: %.6f | Speed: %.2f km/h | Satellites: %d",
-		pkt.DeviceID,
-		pkt.Timestamp.Format(time.RFC3339),
-		pkt.Latitude,
-		pkt.Longitude,
-		pkt.Speed,
-		pkt.Satelites,
-	)
+func (s *Server) acceptLoop() {
+	for {
+		conn, err := s.ln.Accept()
+		if err != nil {
+			fmt.Println("Accept error", err)
+			continue
+		}
+		fmt.Println("New connection to the server", conn.RemoteAddr())
+
+		go s.readLoop(conn)
+	}
+}
+
+func (s *Server) readLoop(conn net.Conn) {
+	defer conn.Close()
+	buf := make([]byte, 2048)
+
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			fmt.Println("Read error", err)
+			continue
+		}
+		s.msgCh <- Message{
+			from:    conn.RemoteAddr().String(),
+			payload: buf[:n],
+		}
+
+		// conn.Write([]byte("writting to tcp client"))
+	}
+
 }
 
 func main() {
-	listener := NewCustomGT06Listener()
+	server := NewServer(":5000")
 
-	// Start TCP listener
-	log.Printf("Starting GT06 TCP server on %s", listener.Listen)
-	netListener, err := net.Listen("tcp", listener.Listen)
-	if err != nil {
-		log.Fatalf("Failed to start TCP server: %v", err)
-	}
-	defer netListener.Close()
-
-	log.Println("Server is running... Waiting for connections.")
-
-	for {
-		conn, err := netListener.Accept()
-		if err != nil {
-			log.Printf("Error accepting connection: %v", err)
-			continue
+	go func() {
+		for msg := range server.msgCh {
+			fmt.Printf("Received message from connectinn (%s): %s\n", msg.from, string(msg.payload))
 		}
-
-		go listener.handleClientConnection(conn)
-	}
+	}()
+	server.Start()
 
 }
