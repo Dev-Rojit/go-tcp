@@ -1,13 +1,21 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"net"
 )
 
+type LoginPacket struct {
+	IMEI         string
+	SerialNumber uint16
+}
+
 type Message struct {
 	from    string
 	payload []byte
+	conn    net.Conn
 }
 
 type Server struct {
@@ -25,6 +33,12 @@ func NewServer(listenAddr string) *Server {
 	}
 }
 
+const (
+	LoginProtocolNum = 0x01
+	StartBit1        = 0x78
+	StartBit2        = 0x79
+)
+
 func (s *Server) Start() error {
 	ln, err := net.Listen("tcp", s.listenAddr)
 	if err != nil {
@@ -32,6 +46,7 @@ func (s *Server) Start() error {
 	}
 	defer ln.Close()
 	s.ln = ln
+	go s.handleMessage()
 	s.acceptLoop()
 	<-s.quitCh
 	close(s.msgCh)
@@ -65,10 +80,104 @@ func (s *Server) readLoop(conn net.Conn) {
 		s.msgCh <- Message{
 			from:    conn.RemoteAddr().String(),
 			payload: buf[:n],
+			conn:    conn,
 		}
 
 		// conn.Write([]byte("writting to tcp client"))
 	}
+}
+
+func (s *Server) handleMessage() {
+	for msg := range s.msgCh {
+		if len(msg.payload) < 4 {
+			fmt.Printf("Message too short for %s", msg.from)
+			continue
+		}
+
+		protocolNumber := msg.payload[2]
+		switch protocolNumber {
+		case LoginProtocolNum:
+			login, err := s.parseLoginPacket(msg.payload)
+			if err != nil {
+				fmt.Printf("Login parse error from %s: %v\n", msg.from, err)
+				continue
+			}
+			fmt.Printf("Login received from %s - IMEI: %s\n", msg.from, login.IMEI)
+			s.sendLoginAck(msg.conn, login.SerialNumber)
+		default:
+			fmt.Printf("Unknown protocol 0x%x from %s\n", protocolNumber, msg.from)
+		}
+	}
+}
+
+func (s *Server) sendLoginAck(conn net.Conn, serialNumber uint16) {
+	if conn == nil {
+		return
+	}
+
+	ack := createLoginAckPacket(serialNumber)
+	_, err := conn.Write(ack)
+	if err != nil {
+		fmt.Printf("Failed to send login ack: %v\n", err)
+	}
+}
+func createLoginAckPacket(serialNumber uint16) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(StartBit1)                           // Start bit
+	buf.WriteByte(0x05)                                // Packet length
+	buf.WriteByte(LoginProtocolNum)                    // Protocol number
+	binary.Write(&buf, binary.BigEndian, serialNumber) // Serial number
+	buf.WriteByte(calculateChecksum(buf.Bytes()[1:]))
+	buf.Write([]byte{0x0D, 0x0A}) // Stop bits
+	return buf.Bytes()
+}
+
+func calculateChecksum(data []byte) byte {
+	var sum byte
+	for _, b := range data {
+		sum ^= b
+	}
+	return sum
+}
+
+func (s *Server) parseLoginPacket(data []byte) (*LoginPacket, error) {
+	// Minimum length for login packet: start(1) + len(1) + proto(1) + IMEI(15) + serial(2) + crc(1) + stop(2)
+	if len(data) < 23 {
+		return nil, fmt.Errorf("packet too short (%d bytes)", len(data))
+	}
+
+	// Validate start bits
+	if data[0] != StartBit1 && data[0] != StartBit2 {
+		return nil, fmt.Errorf("invalid start bit: 0x%x", data[0])
+	}
+
+	// Validate packet length (should be 0x11 or 0x12 for login)
+	packetLen := data[1]
+	if packetLen < 0x11 || packetLen > 0x12 {
+		return nil, fmt.Errorf("invalid login packet length: 0x%x", packetLen)
+	}
+
+	// Extract IMEI (15 ASCII digits)
+	imei := string(data[3:18])
+	if len(imei) != 15 {
+		return nil, fmt.Errorf("invalid IMEI length: %d", len(imei))
+	}
+
+	// Extract serial number (2 bytes)
+	serialNumber := binary.BigEndian.Uint16(data[18:20])
+
+	// Verify checksum (XOR of all bytes except start and stop bits)
+	calculatedChecksum := calculateChecksum(data[1 : len(data)-3])
+	receivedChecksum := data[len(data)-3]
+	if calculatedChecksum != receivedChecksum {
+		return nil, fmt.Errorf("checksum mismatch (calc: 0x%x, recv: 0x%x)",
+			calculatedChecksum, receivedChecksum)
+	}
+
+	return &LoginPacket{
+		IMEI:         imei,
+		SerialNumber: serialNumber,
+	}, nil
 
 }
 
