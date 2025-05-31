@@ -141,32 +141,27 @@ func calculateChecksum(data []byte) byte {
 }
 
 func (s *Server) parseLoginPacket(data []byte) (*LoginPacket, error) {
-	// Minimum length for login packet: start(1) + len(1) + proto(1) + IMEI(15) + serial(2) + crc(1) + stop(2)
+
 	if len(data) < 23 {
 		return nil, fmt.Errorf("packet too short (%d bytes)", len(data))
 	}
 
-	// Validate start bits
 	if data[0] != StartBit1 && data[0] != StartBit2 {
 		return nil, fmt.Errorf("invalid start bit: 0x%x", data[0])
 	}
 
-	// Validate packet length (should be 0x11 or 0x12 for login)
 	packetLen := data[1]
 	if packetLen < 0x11 || packetLen > 0x12 {
 		return nil, fmt.Errorf("invalid login packet length: 0x%x", packetLen)
 	}
 
-	// Extract IMEI (15 ASCII digits)
 	imei := string(data[3:18])
 	if len(imei) != 15 {
 		return nil, fmt.Errorf("invalid IMEI length: %d", len(imei))
 	}
 
-	// Extract serial number (2 bytes)
 	serialNumber := binary.BigEndian.Uint16(data[18:20])
 
-	// Verify checksum (XOR of all bytes except start and stop bits)
 	calculatedChecksum := calculateChecksum(data[1 : len(data)-3])
 	receivedChecksum := data[len(data)-3]
 	if calculatedChecksum != receivedChecksum {
